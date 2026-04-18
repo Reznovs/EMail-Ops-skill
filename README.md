@@ -34,13 +34,13 @@
 
 ```bash
 # Linux / macOS
-git clone https://github.com/Reznovs/EMail-Client-Skill.git ~/mail-ops-skill
+git clone https://github.com/Reznovs/EMail-Ops-skill.git ~/mail-ops-skill
 cd ~/mail-ops-skill
 ```
 
 ```powershell
 # Windows (PowerShell)
-git clone https://github.com/Reznovs/EMail-Client-Skill.git $HOME\mail-ops-skill
+git clone https://github.com/Reznovs/EMail-Ops-skill.git $HOME\mail-ops-skill
 cd $HOME\mail-ops-skill
 ```
 
