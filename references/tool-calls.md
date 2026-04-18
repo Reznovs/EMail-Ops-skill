@@ -12,12 +12,16 @@ python3 scripts/mail_tools.py <tool_name> --input-json '<json>'
 - `setup_account`
 - `doctor_account`
 - `test_login`
+- `list_folders`
 - `list_messages`
 - `search_messages`
 - `get_message`
 - `download_attachments`
 - `send_email`
 - `draft_email`
+- `trash_messages`
+- `restore_messages`
+- `purge_messages`
 
 ## Result Shape
 

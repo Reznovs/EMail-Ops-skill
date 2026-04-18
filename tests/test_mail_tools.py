@@ -43,8 +43,24 @@ class FakeMailClient:
     def __exit__(self, exc_type, exc, tb):
         return None
 
-    def select_folder(self, folder: str) -> None:
+    def select_folder(self, folder: str, readonly: bool = True) -> None:
         self.folder = folder
+        self.readonly = readonly
+
+    def list_folders(self) -> list[dict[str, str]]:
+        return [
+            {"name": "INBOX", "raw_name": "INBOX", "attrs": "\\HasNoChildren", "delimiter": "/"},
+            {"name": "Deleted Messages", "raw_name": "Deleted Messages", "attrs": "\\HasNoChildren", "delimiter": "/"},
+        ]
+
+    def move_uids(self, uids, dest_folder: str) -> None:
+        self.__class__.moved = {"uids": [u.decode() for u in uids], "dest": dest_folder}
+
+    def store_flags(self, uids, flags: str, operation: str = "+") -> None:
+        self.__class__.flagged = {"uids": [u.decode() for u in uids], "flags": flags, "op": operation}
+
+    def expunge_uids(self, uids) -> None:
+        self.__class__.expunged = [u.decode() for u in uids]
 
     def search_all_uids(self) -> list[bytes]:
         return [b"101", b"102"]
@@ -248,7 +264,7 @@ class MailToolsTests(unittest.TestCase):
                     account="work",
                     to=["alice@example.com"],
                     subject="Test",
-                    body="Hello",
+                    html_body="<p>Hello</p>",
                     attachments=[str(attachment_path)],
                     config_path=config_path,
                 )
@@ -262,15 +278,12 @@ class MailToolsTests(unittest.TestCase):
             result = mail_core.draft_email(
                 subject="Project update",
                 body="The work is on track.",
-                tone="formal",
-                to_name="Alex",
-                sender_name="Pat",
                 output=str(output_path),
             )
             self.assertTrue(output_path.exists())
 
         self.assertEqual(result["output_path"], str(output_path))
-        self.assertIn("Project update", result["draft"])
+        self.assertIn("Project update", result["html_draft"])
 
     def test_tool_runner_returns_structured_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -287,6 +300,107 @@ class MailToolsTests(unittest.TestCase):
                 )
 
         self.assertEqual(result["status"], "ok")
+
+    def _setup_mailbox(self, tmpdir):
+        config_path = Path(tmpdir) / "accounts.json"
+        with mock.patch.object(mail_core, "KEYRING_AVAILABLE", False):
+            mail_core.setup_account(
+                account="work",
+                provider="gmail",
+                email="user@example.com",
+                config_path=config_path,
+                auth_secret="real-secret",
+            )
+        return config_path
+
+    def test_trash_preview_does_not_move(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._setup_mailbox(tmpdir)
+            FakeMailClient.moved = None
+            with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
+                 mock.patch.object(mail_core, "_append_audit", lambda *_a, **_k: None):
+                result = mail_core.trash_messages(
+                    account="work", uids=["101"], confirmed=False, config_path=config_path
+                )
+        self.assertEqual(result["status"], "preview")
+        self.assertEqual(result["trash_folder"], "Deleted Messages")
+        self.assertIsNone(FakeMailClient.moved)
+        self.assertEqual(result["messages"][0]["subject"], "Invoice follow-up")
+
+    def test_trash_confirmed_moves_and_audits(self) -> None:
+        audit: list[dict] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._setup_mailbox(tmpdir)
+            FakeMailClient.moved = None
+            with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
+                 mock.patch.object(mail_core, "_append_audit", lambda e: audit.append(e)):
+                result = mail_core.trash_messages(
+                    account="work", uids=["101"], confirmed=True, config_path=config_path
+                )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(FakeMailClient.moved, {"uids": ["101"], "dest": "Deleted Messages"})
+        self.assertEqual(audit[0]["action"], "trash")
+        self.assertIn("Deleted Messages", result["note"])
+
+    def test_trash_refuses_when_source_is_trash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._setup_mailbox(tmpdir)
+            with mock.patch.object(mail_core, "MailClient", FakeMailClient):
+                with self.assertRaises(mail_core.EmailClientError) as ctx:
+                    mail_core.trash_messages(
+                        account="work", uids=["101"], confirmed=True,
+                        folder="Deleted Messages", config_path=config_path,
+                    )
+        self.assertIn("already the trash", str(ctx.exception.message))
+
+    def test_purge_preview_requires_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._setup_mailbox(tmpdir)
+            FakeMailClient.expunged = None
+            with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
+                 mock.patch.object(mail_core, "_append_audit", lambda *_a, **_k: None):
+                result = mail_core.purge_messages(
+                    account="work", uids=["101"], confirmed=False, config_path=config_path
+                )
+        self.assertEqual(result["status"], "preview")
+        self.assertIsNone(FakeMailClient.expunged)
+
+    def test_purge_confirmed_expunges(self) -> None:
+        audit: list[dict] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._setup_mailbox(tmpdir)
+            FakeMailClient.expunged = None
+            FakeMailClient.flagged = None
+            with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
+                 mock.patch.object(mail_core, "_append_audit", lambda e: audit.append(e)):
+                result = mail_core.purge_messages(
+                    account="work", uids=["101"], confirmed=True, config_path=config_path
+                )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(FakeMailClient.flagged["flags"], "(\\Deleted)")
+        self.assertEqual(FakeMailClient.expunged, ["101"])
+        self.assertEqual(audit[0]["action"], "purge")
+
+    def test_restore_moves_out_of_trash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._setup_mailbox(tmpdir)
+            FakeMailClient.moved = None
+            with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
+                 mock.patch.object(mail_core, "_append_audit", lambda *_a, **_k: None):
+                result = mail_core.restore_messages(
+                    account="work", uids=["101"], confirmed=True,
+                    target_folder="INBOX", config_path=config_path,
+                )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(FakeMailClient.moved, {"uids": ["101"], "dest": "INBOX"})
+
+    def test_list_folders_detects_trash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._setup_mailbox(tmpdir)
+            with mock.patch.object(mail_core, "MailClient", FakeMailClient):
+                result = mail_core.list_folders(account="work", config_path=config_path)
+        self.assertEqual(result["trash_folder"], "Deleted Messages")
+        self.assertIn({"name": "INBOX", "raw_name": "INBOX", "attrs": "\\HasNoChildren", "delimiter": "/"}, result["folders"])
 
 
 if __name__ == "__main__":

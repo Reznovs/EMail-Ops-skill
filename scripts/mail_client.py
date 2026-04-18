@@ -15,12 +15,24 @@ def pretty_dump(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def load_body(args: argparse.Namespace) -> str:
-    if getattr(args, "body_file", None):
-        return Path(args.body_file).expanduser().read_text(encoding="utf-8")
-    if getattr(args, "body", None):
-        return args.body
-    raise EmailClientError("must provide --body or --body-file", code="invalid_request")
+def load_html_body(args: argparse.Namespace) -> str:
+    if getattr(args, "html_file", None):
+        return Path(args.html_file).expanduser().read_text(encoding="utf-8")
+    if getattr(args, "html", None):
+        return args.html
+    raise EmailClientError("must provide --html or --html-file", code="invalid_request")
+
+
+def parse_inline_images(entries: list[str] | None) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for entry in entries or []:
+        if "=" not in entry:
+            raise EmailClientError(
+                f"invalid --inline value (expected cid=path): {entry}", code="invalid_request"
+            )
+        cid, path = entry.split("=", 1)
+        result.append({"cid": cid.strip(), "path": path.strip()})
+    return result
 
 
 def cmd_migrate_config(args: argparse.Namespace) -> None:
@@ -150,28 +162,73 @@ def cmd_send_email(args: argparse.Namespace) -> None:
         "account": args.account,
         "to": args.to,
         "subject": args.subject,
-        "body": load_body(args),
+        "html_body": load_html_body(args),
         "config_path": args.config,
         "attachments": args.attach or None,
     }
-    if args.html_file:
-        payload["html_body"] = Path(args.html_file).expanduser().read_text(encoding="utf-8")
+    inline_images = parse_inline_images(args.inline)
+    if inline_images:
+        payload["inline_images"] = inline_images
+    if args.ics_file:
+        payload["ics_file"] = args.ics_file
+    if args.ics_json:
+        payload["ics_event"] = json.loads(args.ics_json)
+    if args.ics_filename:
+        payload["ics_filename"] = args.ics_filename
     pretty_dump(run_tool("send_email", payload))
 
 
 def cmd_draft_email(args: argparse.Namespace) -> None:
+    body_text = ""
+    if getattr(args, "body_file", None):
+        body_text = Path(args.body_file).expanduser().read_text(encoding="utf-8")
+    elif getattr(args, "body", None):
+        body_text = args.body
     result = draft_email(
         subject=args.subject,
-        body=load_body(args),
-        tone=args.tone,
-        to_name=args.to_name,
-        sender_name=args.sender_name,
+        body=body_text,
         output=args.output,
     )
     if result["output_path"]:
         print(f"draft_saved: {result['output_path']}")
         return
-    print(result["draft"])
+    print(result["html_draft"])
+
+
+def cmd_list_folders(args: argparse.Namespace) -> None:
+    pretty_dump(run_tool("list_folders", {"account": args.account, "config_path": args.config}))
+
+
+def cmd_trash_messages(args: argparse.Namespace) -> None:
+    pretty_dump(run_tool("trash_messages", {
+        "account": args.account,
+        "uids": args.uid,
+        "confirmed": args.confirm,
+        "folder": args.folder,
+        "trash_folder": args.trash_folder,
+        "config_path": args.config,
+    }))
+
+
+def cmd_restore_messages(args: argparse.Namespace) -> None:
+    pretty_dump(run_tool("restore_messages", {
+        "account": args.account,
+        "uids": args.uid,
+        "confirmed": args.confirm,
+        "target_folder": args.target_folder,
+        "trash_folder": args.trash_folder,
+        "config_path": args.config,
+    }))
+
+
+def cmd_purge_messages(args: argparse.Namespace) -> None:
+    pretty_dump(run_tool("purge_messages", {
+        "account": args.account,
+        "uids": args.uid,
+        "confirmed": args.confirm,
+        "trash_folder": args.trash_folder,
+        "config_path": args.config,
+    }))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -248,21 +305,54 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser.add_argument("--account", required=True)
     send_parser.add_argument("--to", nargs="+", required=True)
     send_parser.add_argument("--subject", required=True)
-    send_parser.add_argument("--body")
-    send_parser.add_argument("--body-file")
-    send_parser.add_argument("--html-file")
-    send_parser.add_argument("--attach", action="append")
+    send_parser.add_argument("--html", help="HTML 正文字符串")
+    send_parser.add_argument("--html-file", help="HTML 正文文件路径")
+    send_parser.add_argument("--attach", action="append", help="普通附件路径（可多次）")
+    send_parser.add_argument(
+        "--inline", action="append",
+        help='内联图片，格式 cid=path，HTML 中用 <img src="cid:xxx"> 引用（可多次）',
+    )
+    send_parser.add_argument("--ics-file", help="日程 ICS 文件路径")
+    send_parser.add_argument(
+        "--ics-json",
+        help='日程事件 JSON，字段：summary/start/end/location/description/attendees',
+    )
+    send_parser.add_argument("--ics-filename", default="invite.ics")
     send_parser.set_defaults(func=cmd_send_email)
 
     draft_parser = subparsers.add_parser("draft_email")
     draft_parser.add_argument("--subject", required=True)
     draft_parser.add_argument("--body")
     draft_parser.add_argument("--body-file")
-    draft_parser.add_argument("--tone", choices=["colleague", "formal", "support"], default="colleague")
-    draft_parser.add_argument("--to-name", default="")
-    draft_parser.add_argument("--sender-name", default="")
     draft_parser.add_argument("--output")
     draft_parser.set_defaults(func=cmd_draft_email)
+
+    folders_parser = subparsers.add_parser("list_folders", help="列出邮箱所有文件夹并识别回收站")
+    folders_parser.add_argument("--account", required=True)
+    folders_parser.set_defaults(func=cmd_list_folders)
+
+    trash_parser = subparsers.add_parser("trash_messages", help="软删：移到回收站（默认预览模式，--confirm 才执行）")
+    trash_parser.add_argument("--account", required=True)
+    trash_parser.add_argument("--uid", action="append", required=True, help="可多次；UID 数字")
+    trash_parser.add_argument("--folder", default="INBOX", help="来源文件夹")
+    trash_parser.add_argument("--trash-folder", default=None, help="显式指定回收站文件夹（不传则自动识别）")
+    trash_parser.add_argument("--confirm", action="store_true", help="真正执行；不加则只预览")
+    trash_parser.set_defaults(func=cmd_trash_messages)
+
+    restore_parser = subparsers.add_parser("restore_messages", help="从回收站恢复到指定文件夹")
+    restore_parser.add_argument("--account", required=True)
+    restore_parser.add_argument("--uid", action="append", required=True)
+    restore_parser.add_argument("--target-folder", default="INBOX")
+    restore_parser.add_argument("--trash-folder", default=None)
+    restore_parser.add_argument("--confirm", action="store_true")
+    restore_parser.set_defaults(func=cmd_restore_messages)
+
+    purge_parser = subparsers.add_parser("purge_messages", help="硬删：仅对回收站内 UID 有效；不可恢复")
+    purge_parser.add_argument("--account", required=True)
+    purge_parser.add_argument("--uid", action="append", required=True)
+    purge_parser.add_argument("--trash-folder", default=None)
+    purge_parser.add_argument("--confirm", action="store_true")
+    purge_parser.set_defaults(func=cmd_purge_messages)
 
     return parser
 

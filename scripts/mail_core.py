@@ -6,6 +6,7 @@ import base64
 import html
 import imaplib
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -13,8 +14,9 @@ import smtplib
 import socket
 import ssl
 import tempfile
+import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
@@ -29,10 +31,39 @@ DEFAULT_SCAN = 200
 CONNECT_TIMEOUT = float(os.environ.get("CODEX_MAIL_CONNECT_TIMEOUT", "15"))
 TEMP_DOWNLOAD_PREFIX = "codex-mail-"
 APPROVED_ATTACHMENTS_FILE = ".codex-mail-attachments.json"
-DEFAULT_CONFIG = Path(
-    os.environ.get("CODEX_MAIL_ACCOUNTS", "~/.config/codex-mail/accounts.json")
-).expanduser()
-KEYRING_SERVICE = "codex-mail"
+
+
+def _resolve_default_config() -> Path:
+    """跨平台的默认凭据文件路径。
+
+    优先级：
+    1. 环境变量 `MAIL_OPS_ACCOUNTS`（新）或 `CODEX_MAIL_ACCOUNTS`（旧，向后兼容）
+    2. Windows: `%APPDATA%\\mail-ops\\accounts.json`
+       POSIX:   `${XDG_CONFIG_HOME:-$HOME/.config}/mail-ops/accounts.json`
+    3. 若上述新路径不存在、但旧版 `codex-mail/accounts.json` 仍在，则沿用旧路径。
+
+    凭据文件**始终位于用户主目录下的配置目录**，不在仓库内，开源仓库只需
+    在 `.gitignore` 中排除本机偶然生成的配置文件即可。
+    """
+    for env_name in ("MAIL_OPS_ACCOUNTS", "CODEX_MAIL_ACCOUNTS"):
+        value = os.environ.get(env_name)
+        if value:
+            return Path(value).expanduser()
+
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+
+    new_path = Path(base) / "mail-ops" / "accounts.json"
+    legacy_path = Path(base) / "codex-mail" / "accounts.json"
+    if not new_path.exists() and legacy_path.exists():
+        return legacy_path
+    return new_path
+
+
+DEFAULT_CONFIG = _resolve_default_config()
+KEYRING_SERVICE = "mail-ops"
 
 try:
     import keyring
@@ -173,12 +204,19 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
     temp_path = path.with_name(f".{path.name}.tmp")
     with open(temp_path, "w", encoding="utf-8") as handle:
-        os.chmod(temp_path, 0o600)
+        if os.name != "nt":
+            os.chmod(temp_path, 0o600)
         handle.write(render_config(data))
     os.replace(temp_path, path)
-    os.chmod(path, 0o600)
+    if os.name != "nt":
+        os.chmod(path, 0o600)
 
 
 def _blank_v2() -> dict[str, Any]:
@@ -221,7 +259,11 @@ def retrieve_secret_secure(keyring_key: str) -> str | None:
     if not KEYRING_AVAILABLE:
         return None
     try:
-        return keyring.get_password(KEYRING_SERVICE, keyring_key)
+        value = keyring.get_password(KEYRING_SERVICE, keyring_key)
+        if value:
+            return value
+        # 向后兼容旧 service 名
+        return keyring.get_password("codex-mail", keyring_key)
     except Exception:
         return None
 
@@ -1247,6 +1289,35 @@ def create_imap_client(account: AccountConfig) -> imaplib.IMAP4 | imaplib.IMAP4_
     return client
 
 
+def _imap_utf7_decode(name: str) -> str:
+    """解码 IMAP modified UTF-7 文件夹名（RFC 3501 §5.1.3）。"""
+    if "&" not in name:
+        return name
+    out: list[str] = []
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch == "&":
+            end = name.find("-", i + 1)
+            if end == -1:
+                out.append(name[i:])
+                break
+            segment = name[i + 1:end]
+            if segment == "":
+                out.append("&")
+            else:
+                b64 = segment.replace(",", "/") + "=" * (-len(segment) % 4)
+                try:
+                    out.append(base64.b64decode(b64).decode("utf-16-be"))
+                except Exception:
+                    out.append("&" + segment + "-")
+            i = end + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 class MailClient:
     def __init__(self, account: AccountConfig) -> None:
         self.account = account
@@ -1270,13 +1341,87 @@ class MailClient:
             raise RuntimeError("IMAP is not connected")
         return self.imap
 
-    def select_folder(self, folder: str) -> None:
+    def select_folder(self, folder: str, readonly: bool = True) -> None:
         mailbox = folder
         if " " in mailbox and not (mailbox.startswith('"') and mailbox.endswith('"')):
             mailbox = f'"{mailbox}"'
-        status, _ = self._require_imap().select(mailbox, readonly=True)
+        status, _ = self._require_imap().select(mailbox, readonly=readonly)
         if status != "OK":
             raise RuntimeError(f"failed to open mailbox folder: {folder}")
+
+    def list_folders(self) -> list[dict[str, str]]:
+        status, data = self._require_imap().list()
+        if status != "OK" or not data:
+            return []
+        folders: list[dict[str, str]] = []
+        pattern = re.compile(rb'^\((?P<attrs>[^)]*)\)\s+(?P<delim>"[^"]*"|NIL)\s+(?P<name>.+)$')
+        for raw in data:
+            if raw is None:
+                continue
+            line = raw if isinstance(raw, bytes) else bytes(raw)
+            m = pattern.match(line.strip())
+            if not m:
+                continue
+            name_raw = m.group("name").decode("utf-8", errors="replace").strip()
+            if name_raw.startswith('"') and name_raw.endswith('"'):
+                name_raw = name_raw[1:-1]
+            # IMAP UTF-7 decoding for folder names
+            try:
+                decoded_name = _imap_utf7_decode(name_raw)
+            except Exception:
+                decoded_name = name_raw
+            attrs = m.group("attrs").decode("utf-8", errors="replace")
+            delim = m.group("delim").decode("utf-8", errors="replace").strip('"')
+            folders.append({"name": decoded_name, "raw_name": name_raw, "attrs": attrs, "delimiter": delim})
+        return folders
+
+    def move_uids(self, uids: list[bytes], dest_folder: str) -> None:
+        if not uids:
+            return
+        imap = self._require_imap()
+        uid_set = b",".join(uids)
+        mailbox = dest_folder
+        if " " in mailbox and not (mailbox.startswith('"') and mailbox.endswith('"')):
+            mailbox = f'"{mailbox}"'
+        # 优先 UID MOVE（RFC 6851），失败回退 COPY + STORE \Deleted + EXPUNGE
+        try:
+            status, _ = imap.uid("MOVE", uid_set, mailbox)
+            if status == "OK":
+                return
+        except Exception:
+            pass
+        status, _ = imap.uid("COPY", uid_set, mailbox)
+        if status != "OK":
+            raise RuntimeError(f"failed to copy to {dest_folder}")
+        imap.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
+        try:
+            imap.uid("EXPUNGE", uid_set)
+        except Exception:
+            imap.expunge()
+
+    def store_flags(self, uids: list[bytes], flags: str, operation: str = "+") -> None:
+        if not uids:
+            return
+        if operation not in {"+", "-"}:
+            raise ValueError("operation must be '+' or '-'")
+        imap = self._require_imap()
+        uid_set = b",".join(uids)
+        status, _ = imap.uid("STORE", uid_set, f"{operation}FLAGS", flags)
+        if status != "OK":
+            raise RuntimeError(f"failed to {operation}FLAGS {flags}")
+
+    def expunge_uids(self, uids: list[bytes]) -> None:
+        if not uids:
+            return
+        imap = self._require_imap()
+        uid_set = b",".join(uids)
+        try:
+            status, _ = imap.uid("EXPUNGE", uid_set)
+            if status == "OK":
+                return
+        except Exception:
+            pass
+        imap.expunge()
 
     def search_all_uids(self) -> list[bytes]:
         status, data = self._require_imap().uid("search", None, "ALL")
@@ -1368,30 +1513,76 @@ def send_email(
     *,
     to: str | list[str],
     subject: str,
-    body: str,
-    html_body: str | None = None,
+    html_body: str,
+    plain_body: str | None = None,
     attachments: list[str] | None = None,
+    inline_images: list[dict[str, str]] | None = None,
+    ics_content: str | None = None,
+    ics_filename: str = "invite.ics",
 ) -> dict[str, Any]:
+    if not html_body or not html_body.strip():
+        raise EmailClientError("html_body is required", code="invalid_request")
     recipients = normalize_recipients(to)
+
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = f"{account.display_name} <{account.email}>"
     msg["To"] = ", ".join(recipients)
-    msg.set_content(body, charset="utf-8")
 
-    if html_body:
-        msg.add_alternative(html_body, subtype="html", charset="utf-8")
+    # 纯文本降级版本（用于反垃圾扫描 / 不支持 HTML 的客户端）
+    fallback_plain = plain_body if plain_body is not None else derive_plain_from_html(html_body)
+    msg.set_content(fallback_plain or "(HTML content)", charset="utf-8")
+    msg.add_alternative(html_body, subtype="html", charset="utf-8")
+
+    # 内联图片（表情/自定义图片），以 cid: 方式在 HTML 中引用
+    if inline_images:
+        html_part = msg.get_payload()[-1]
+        for item in inline_images:
+            cid = (item.get("cid") or "").strip()
+            path_value = (item.get("path") or "").strip()
+            if not cid or not path_value:
+                raise EmailClientError("inline image requires cid and path", code="invalid_request")
+            img_path = _validate_send_attachment(path_value)
+            mime_type, _ = mimetypes.guess_type(str(img_path))
+            if not mime_type or not mime_type.startswith("image/"):
+                raise EmailClientError(
+                    f"inline image must be an image file: {img_path}", code="invalid_request"
+                )
+            maintype, subtype = mime_type.split("/", 1)
+            html_part.add_related(
+                img_path.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                cid=f"<{cid}>",
+                filename=img_path.name,
+            )
 
     attached_files: list[str] = []
     for attachment in attachments or []:
         path = _validate_send_attachment(attachment)
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if mime_type and "/" in mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
         msg.add_attachment(
             path.read_bytes(),
-            maintype="application",
-            subtype="octet-stream",
+            maintype=maintype,
+            subtype=subtype,
             filename=path.name,
         )
         attached_files.append(str(path))
+
+    # 日程 ICS（作为 text/calendar 附件，QQ 邮箱会识别为日历邀请）
+    if ics_content:
+        ics_bytes = ics_content.encode("utf-8")
+        msg.add_attachment(
+            ics_bytes,
+            maintype="text",
+            subtype="calendar",
+            filename=ics_filename,
+            params={"method": "REQUEST", "charset": "utf-8", "name": ics_filename},
+        )
 
     context = ssl.create_default_context()
     if account.smtp.uses_ssl:
@@ -1420,6 +1611,8 @@ def send_email(
         "to": recipients,
         "subject": subject,
         "attachments": attached_files,
+        "inline_images": [item.get("cid", "") for item in (inline_images or [])],
+        "ics_attached": bool(ics_content),
         "status": "sent",
     }
 
@@ -1552,39 +1745,341 @@ def download_attachments(
     }
 
 
+# ---------------------------------------------------------------------------
+# 文件夹 / 软删 / 恢复 / 硬删
+# ---------------------------------------------------------------------------
+
+# 常见回收站文件夹名（不区分大小写 / 含前后空白）
+TRASH_CANDIDATES = (
+    "trash",
+    "deleted",
+    "deleted messages",
+    "deleted items",
+    "[gmail]/trash",
+    "已删除",
+    "已删除邮件",
+    "垃圾箱",
+    "废件箱",
+    "废纸篓",
+)
+
+
+def _audit_log_path() -> Path:
+    return DEFAULT_CONFIG.parent / "audit.log"
+
+
+def _append_audit(entry: dict[str, Any]) -> None:
+    path = _audit_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+    entry = {"ts": datetime.now(tz=timezone.utc).isoformat(), **entry}
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def _detect_trash_folder(folders: list[dict[str, str]], override: str | None = None) -> str | None:
+    if override:
+        for item in folders:
+            if item["name"] == override or item.get("raw_name") == override:
+                return item.get("raw_name") or item["name"]
+        return override
+    # 1) 按 IMAP 属性 \Trash 匹配
+    for item in folders:
+        if "\\Trash" in (item.get("attrs") or ""):
+            return item.get("raw_name") or item["name"]
+    # 2) 按常见名称匹配
+    names = {item["name"].lower(): item for item in folders}
+    for candidate in TRASH_CANDIDATES:
+        if candidate in names:
+            item = names[candidate]
+            return item.get("raw_name") or item["name"]
+    # 3) 模糊匹配
+    for item in folders:
+        lower = item["name"].lower()
+        if "trash" in lower or "删除" in item["name"] or "垃圾" in item["name"] or "废" in item["name"]:
+            return item.get("raw_name") or item["name"]
+    return None
+
+
+def _normalize_uids(uids: Any) -> list[bytes]:
+    if isinstance(uids, (str, int, bytes)):
+        uids = [uids]
+    if not isinstance(uids, list):
+        raise EmailClientError("uids must be a list", code="invalid_request")
+    normalized: list[bytes] = []
+    for item in uids:
+        value = str(item).strip()
+        if not value or not value.isdigit():
+            raise EmailClientError(f"invalid uid: {item!r}", code="invalid_request")
+        normalized.append(value.encode())
+    if not normalized:
+        raise EmailClientError("at least one uid is required", code="invalid_request")
+    if len(normalized) > 50:
+        raise EmailClientError("batch too large: max 50 uids per call", code="invalid_request")
+    return normalized
+
+
+def _collect_previews(client: "MailClient", uids: list[bytes]) -> list[dict[str, str]]:
+    previews: list[dict[str, str]] = []
+    for uid in uids:
+        try:
+            header = client.fetch_headers(uid)
+        except Exception as exc:
+            previews.append({"uid": uid.decode(), "error": str(exc)})
+            continue
+        previews.append(header)
+    return previews
+
+
+def list_folders(
+    *,
+    account: str,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    mailbox = load_account(account, config_path)
+    with MailClient(mailbox) as client:
+        folders = client.list_folders()
+    trash = _detect_trash_folder(folders)
+    return {
+        "status": "ok",
+        "account": mailbox.name,
+        "folders": folders,
+        "trash_folder": trash,
+    }
+
+
+def trash_messages(
+    *,
+    account: str,
+    uids: list[str] | str,
+    confirmed: bool = False,
+    folder: str = DEFAULT_FOLDER,
+    trash_folder: str | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """软删：从 folder 移到回收站。confirmed=False 时只返回预览，不执行。"""
+    mailbox = load_account(account, config_path)
+    uid_list = _normalize_uids(uids)
+    with MailClient(mailbox) as client:
+        folders = client.list_folders()
+        resolved_trash = _detect_trash_folder(folders, override=trash_folder)
+        if not resolved_trash:
+            raise EmailClientError(
+                "could not locate a Trash folder; pass trash_folder explicitly",
+                code="invalid_request",
+            )
+        # 禁止对"本身就在回收站"的 UID 再软删（避免循环）
+        if _folder_equals(folder, resolved_trash):
+            raise EmailClientError(
+                "source folder is already the trash folder; use purge_messages to hard-delete",
+                code="invalid_request",
+            )
+
+        client.select_folder(folder, readonly=True)
+        previews = _collect_previews(client, uid_list)
+        if not confirmed:
+            return {
+                "status": "preview",
+                "action": "trash",
+                "account": mailbox.name,
+                "folder": folder,
+                "trash_folder": resolved_trash,
+                "messages": previews,
+                "note": "confirmed=false → 未执行。让用户确认后再以 confirmed=true 重新调用。",
+            }
+
+        client.select_folder(folder, readonly=False)
+        client.move_uids(uid_list, resolved_trash)
+
+    _append_audit(
+        {
+            "action": "trash",
+            "account": mailbox.name,
+            "folder": folder,
+            "trash_folder": resolved_trash,
+            "uids": [u.decode() for u in uid_list],
+            "messages": previews,
+        }
+    )
+    return {
+        "status": "ok",
+        "action": "trash",
+        "account": mailbox.name,
+        "folder": folder,
+        "trash_folder": resolved_trash,
+        "moved_uids": [u.decode() for u in uid_list],
+        "messages": previews,
+        "note": f"已移至回收站『{resolved_trash}』，可通过 restore_messages 恢复。",
+    }
+
+
+def restore_messages(
+    *,
+    account: str,
+    uids: list[str] | str,
+    confirmed: bool = False,
+    target_folder: str = DEFAULT_FOLDER,
+    trash_folder: str | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """从回收站恢复到 target_folder。"""
+    mailbox = load_account(account, config_path)
+    uid_list = _normalize_uids(uids)
+    with MailClient(mailbox) as client:
+        folders = client.list_folders()
+        resolved_trash = _detect_trash_folder(folders, override=trash_folder)
+        if not resolved_trash:
+            raise EmailClientError("could not locate Trash folder", code="invalid_request")
+        client.select_folder(resolved_trash, readonly=True)
+        previews = _collect_previews(client, uid_list)
+        if not confirmed:
+            return {
+                "status": "preview",
+                "action": "restore",
+                "account": mailbox.name,
+                "trash_folder": resolved_trash,
+                "target_folder": target_folder,
+                "messages": previews,
+                "note": "confirmed=false → 未执行。让用户确认后再以 confirmed=true 重新调用。",
+            }
+        client.select_folder(resolved_trash, readonly=False)
+        client.move_uids(uid_list, target_folder)
+
+    _append_audit(
+        {
+            "action": "restore",
+            "account": mailbox.name,
+            "trash_folder": resolved_trash,
+            "target_folder": target_folder,
+            "uids": [u.decode() for u in uid_list],
+            "messages": previews,
+        }
+    )
+    return {
+        "status": "ok",
+        "action": "restore",
+        "account": mailbox.name,
+        "trash_folder": resolved_trash,
+        "target_folder": target_folder,
+        "restored_uids": [u.decode() for u in uid_list],
+        "messages": previews,
+        "note": f"已从『{resolved_trash}』恢复到『{target_folder}』。",
+    }
+
+
+def purge_messages(
+    *,
+    account: str,
+    uids: list[str] | str,
+    confirmed: bool = False,
+    trash_folder: str | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """硬删：只能对"已在回收站"的 UID 执行，且需要 confirmed=true。不可恢复。"""
+    mailbox = load_account(account, config_path)
+    uid_list = _normalize_uids(uids)
+    with MailClient(mailbox) as client:
+        folders = client.list_folders()
+        resolved_trash = _detect_trash_folder(folders, override=trash_folder)
+        if not resolved_trash:
+            raise EmailClientError("could not locate Trash folder", code="invalid_request")
+        client.select_folder(resolved_trash, readonly=True)
+        previews = _collect_previews(client, uid_list)
+        # 校验每个 UID 都能在 Trash 里 fetch 到 header（否则拒绝）
+        missing = [p for p in previews if p.get("error")]
+        if missing:
+            raise EmailClientError(
+                "purge_messages only accepts UIDs already in the Trash folder; "
+                f"the following are not reachable there: {[p['uid'] for p in missing]}",
+                code="invalid_request",
+                details={"unreachable": missing, "trash_folder": resolved_trash},
+            )
+        if not confirmed:
+            return {
+                "status": "preview",
+                "action": "purge",
+                "account": mailbox.name,
+                "trash_folder": resolved_trash,
+                "messages": previews,
+                "note": "confirmed=false → 未执行。硬删不可恢复，请让用户二次明确后再以 confirmed=true 调用。",
+            }
+        client.select_folder(resolved_trash, readonly=False)
+        client.store_flags(uid_list, "(\\Deleted)", operation="+")
+        client.expunge_uids(uid_list)
+
+    _append_audit(
+        {
+            "action": "purge",
+            "account": mailbox.name,
+            "trash_folder": resolved_trash,
+            "uids": [u.decode() for u in uid_list],
+            "messages": previews,
+        }
+    )
+    return {
+        "status": "ok",
+        "action": "purge",
+        "account": mailbox.name,
+        "trash_folder": resolved_trash,
+        "purged_uids": [u.decode() for u in uid_list],
+        "messages": previews,
+        "note": "已永久删除，无法恢复。",
+    }
+
+
+def _folder_equals(a: str, b: str) -> bool:
+    def norm(x: str) -> str:
+        return x.strip().strip('"').lower()
+    return norm(a) == norm(b)
+
+
 def send_email_tool(
     *,
     account: str,
     to: str | list[str],
     subject: str,
-    body: str,
-    config_path: str | Path | None = None,
     html_body: str | None = None,
+    plain_body: str | None = None,
+    config_path: str | Path | None = None,
     attachments: list[str] | None = None,
-    tone: str = "colleague",
-    to_name: str = "",
-    sender_name: str = "",
+    inline_images: list[dict[str, str]] | None = None,
+    ics_content: str | None = None,
+    ics_file: str | None = None,
+    ics_event: dict[str, Any] | None = None,
+    ics_filename: str = "invite.ics",
 ) -> dict[str, Any]:
     mailbox = load_account(account, config_path)
 
-    # 如果没有提供 html_body,自动生成 HTML 格式
     final_html_body = html_body
     if final_html_body is None:
-        _, final_html_body = compose_email_body(
-            subject=subject,
-            content=body,
-            tone=tone,
-            to_name=to_name,
-            sender_name=sender_name or mailbox.display_name,
-        )
+        final_html_body = compose_email_body(subject=subject, content="")
+
+    # ICS 来源：ics_content > ics_file > ics_event
+    final_ics = ics_content
+    if final_ics is None and ics_file:
+        final_ics = Path(ics_file).expanduser().read_text(encoding="utf-8")
+    if final_ics is None and ics_event:
+        final_ics = build_ics(ics_event, organizer_email=mailbox.email)
 
     return send_email(
         mailbox,
         to=to,
         subject=subject,
-        body=body,
         html_body=final_html_body,
+        plain_body=plain_body,
         attachments=attachments,
+        inline_images=inline_images,
+        ics_content=final_ics,
+        ics_filename=ics_filename,
     )
 
 
@@ -1625,93 +2120,131 @@ def test_login(
     }
 
 
-def compose_email_body(subject: str, content: str, tone: str, to_name: str, sender_name: str) -> tuple[str, str]:
-    """生成邮件正文,返回 (纯文本版本, HTML版本)"""
-    greeting_name = to_name or "there"
-    sign_name = sender_name or "[Your Name]"
-    stripped = content.strip()
+def derive_plain_from_html(html_text: str) -> str:
+    """从 HTML 自动提取纯文本降级版本，用于 multipart/alternative 的 text/plain 部分。"""
+    if not html_text:
+        return ""
+    return clean_html_text(html_text)
 
-    # 将换行转换为 HTML 段落
-    html_content = stripped.replace("\n\n", "</p><p>").replace("\n", "<br>")
 
-    if tone == "formal":
-        text_body = (
-            f"Hello {greeting_name},\n\n"
-            f"I am writing regarding {subject}.\n\n"
-            f"{stripped}\n\n"
-            "Please let me know if you would like me to provide any additional detail.\n\n"
-            f"Best regards,\n{sign_name}"
-        )
-        html_body = (
-            f"<p>Hello <strong>{greeting_name}</strong>,</p>"
-            f"<p>I am writing regarding <em>{subject}</em>.</p>"
-            f"<p>{html_content}</p>"
-            "<p>Please let me know if you would like me to provide any additional detail.</p>"
-            f"<p>Best regards,<br>{sign_name}</p>"
-        )
-    elif tone == "support":
-        text_body = (
-            f"Hello {greeting_name},\n\n"
-            f"This message is about {subject}.\n\n"
-            f"{stripped}\n\n"
-            "If you need anything else, please reply to this email and I will follow up.\n\n"
-            f"Regards,\n{sign_name}"
-        )
-        html_body = (
-            f"<p>Hello <strong>{greeting_name}</strong>,</p>"
-            f"<p>This message is about <em>{subject}</em>.</p>"
-            f"<p>{html_content}</p>"
-            "<p>If you need anything else, please reply to this email and I will follow up.</p>"
-            f"<p>Regards,<br>{sign_name}</p>"
-        )
-    else:  # colleague
-        text_body = (
-            f"Hi {greeting_name},\n\n"
-            f"I wanted to follow up on {subject}.\n\n"
-            f"{stripped}\n\n"
-            "Let me know if you want me to adjust anything or send a revised version.\n\n"
-            f"Thanks,\n{sign_name}"
-        )
-        html_body = (
-            f"<p>Hi <strong>{greeting_name}</strong>,</p>"
-            f"<p>I wanted to follow up on <em>{subject}</em>.</p>"
-            f"<p>{html_content}</p>"
-            "<p>Let me know if you want me to adjust anything or send a revised version.</p>"
-            f"<p>Thanks,<br>{sign_name}</p>"
-        )
+def _ics_escape(text: str) -> str:
+    return (
+        (text or "")
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
 
-    return text_body, html_body
+
+def _ics_format_dt(value: Any) -> str:
+    """接受 datetime 或形如 '2026-04-20 14:00' / '2026-04-20T14:00:00' 的字符串，
+    统一输出为 ICS 要求的 UTC 时间 `YYYYMMDDTHHMMSSZ`。"""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip().replace("/", "-")
+        # 支持 '2026-04-20 14:00' 或 '2026-04-20T14:00:00'
+        raw = raw.replace(" ", "T")
+        # 尝试多种格式
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise EmailClientError(f"invalid datetime for ICS: {value}", code="invalid_request")
+    if dt.tzinfo is None:
+        # 视为本地时间，转为 UTC
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_ics(event: dict[str, Any], *, organizer_email: str = "") -> str:
+    """根据事件字典构建 ICS 文本。字段：summary, start, end, location, description, attendees(list)。"""
+    summary = event.get("summary") or event.get("title") or "Meeting"
+    start = event.get("start")
+    end = event.get("end") or start
+    if not start:
+        raise EmailClientError("ics event requires start", code="invalid_request")
+    dtstart = _ics_format_dt(start)
+    dtend = _ics_format_dt(end)
+    dtstamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    uid = event.get("uid") or f"{uuid.uuid4()}@mail-ops-skill"
+    location = event.get("location", "")
+    description = event.get("description", "")
+    attendees = event.get("attendees") or []
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Mail Ops Skill//ZH//",
+        "CALSCALE:GREGORIAN",
+        "METHOD:REQUEST",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART:{dtstart}",
+        f"DTEND:{dtend}",
+        f"SUMMARY:{_ics_escape(summary)}",
+    ]
+    if location:
+        lines.append(f"LOCATION:{_ics_escape(location)}")
+    if description:
+        lines.append(f"DESCRIPTION:{_ics_escape(description)}")
+    if organizer_email:
+        lines.append(f"ORGANIZER;CN={organizer_email}:mailto:{organizer_email}")
+    for att in attendees:
+        if isinstance(att, dict):
+            email_addr = att.get("email", "")
+            cn = att.get("name") or email_addr
+        else:
+            email_addr = str(att)
+            cn = email_addr
+        if email_addr:
+            lines.append(
+                f"ATTENDEE;CN={_ics_escape(cn)};RSVP=TRUE:mailto:{email_addr}"
+            )
+    lines.extend(["END:VEVENT", "END:VCALENDAR"])
+    return "\r\n".join(lines) + "\r\n"
+
+
+def compose_email_body(subject: str = "", content: str = "", **_: Any) -> str:
+    """生成一个带 QQ 邮箱友好内联样式的 HTML 壳。调用方通常直接提供完整 HTML；
+    此函数仅在未提供 HTML 时作为兜底包裹 content 文本。"""
+    safe_content = html.escape(content or "").replace("\n\n", "</p><p>").replace("\n", "<br>")
+    body_inner = f"<p>{safe_content}</p>" if safe_content else ""
+    subj = html.escape(subject or "").strip()
+    header = f'<h3 style="margin:0 0 10px;color:#1a73e8;">{subj}</h3>' if subj else ""
+    return (
+        '<div style="font-family:\'Microsoft YaHei\',\'PingFang SC\',Arial,sans-serif;'
+        'font-size:14px;color:#222;line-height:1.7;">'
+        f"{header}{body_inner}"
+        "</div>"
+    )
 
 
 def draft_email(
     *,
     subject: str,
     body: str,
-    tone: str = "colleague",
     to_name: str = "",
     sender_name: str = "",
     output: str | None = None,
+    **_: Any,
 ) -> dict[str, Any]:
-    if tone not in {"colleague", "formal", "support"}:
-        raise EmailClientError("tone must be colleague, formal, or support", code="invalid_request")
-    text_draft, html_draft = compose_email_body(
-        subject=subject,
-        content=body,
-        tone=tone,
-        to_name=to_name,
-        sender_name=sender_name,
-    )
+    html_draft = compose_email_body(subject=subject, content=body)
     output_path = ""
     if output:
         output_path = str(Path(output).expanduser())
-        # 保存 HTML 版本到文件
         Path(output_path).write_text(html_draft, encoding="utf-8")
     return {
         "status": "ok",
         "subject": subject,
-        "tone": tone,
-        "draft": text_draft,  # 返回纯文本版本用于预览
-        "html_draft": html_draft,  # 同时返回 HTML 版本
+        "html_draft": html_draft,
+        "text_preview": derive_plain_from_html(html_draft),
         "output_path": output_path,
     }
 

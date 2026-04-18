@@ -15,12 +15,16 @@ from mail_core import (
     download_attachments,
     draft_email,
     get_message,
+    list_folders,
     list_messages,
     migrate_config,
+    purge_messages,
+    restore_messages,
     search_messages,
     send_email_tool,
     setup_account,
     test_login,
+    trash_messages,
 )
 
 
@@ -29,12 +33,16 @@ TOOL_MAP: dict[str, Callable[..., dict[str, Any]]] = {
     "setup_account": setup_account,
     "doctor_account": doctor_account,
     "test_login": test_login,
+    "list_folders": list_folders,
     "list_messages": list_messages,
     "search_messages": search_messages,
     "get_message": get_message,
     "download_attachments": download_attachments,
     "send_email": send_email_tool,
     "draft_email": draft_email,
+    "trash_messages": trash_messages,
+    "restore_messages": restore_messages,
+    "purge_messages": purge_messages,
 }
 
 

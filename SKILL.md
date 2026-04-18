@@ -1,15 +1,15 @@
 ---
-name: email-client-skill
-description: "Use this skill when Codex needs to handle mailbox work with the bundled email-client-skill project: inspect or migrate a mail config, set up an account, test login, list or search messages, read a message by UID, download attachments, draft an email, or send an email. Prefer the bundled local tool-call layer for deterministic execution, and use the references for provider rules, storage behavior, and writing style."
+name: mail-ops-skill
+description: "Use this skill for mailbox operations via the bundled Mail Ops Skill scripts: account setup, login checks, listing and searching messages, reading by UID, downloading attachments, drafting HTML, sending HTML mail (with attachments, inline images and ICS invites), and deletion (soft delete to Trash, restore, and hard delete that is only allowed from the Trash folder). All outgoing mail is HTML. See references/writing-style.md, references/safety.md and references/tool-calls.md."
 ---
 
-# Email Client Skill
+# Mail Ops Skill (邮件运维工程师 Skill)
 
 ## Overview
 
-Use this skill to perform email work through the bundled local scripts, not through an external MCP dependency. Keep the workflow tight, stay inside the project boundary, and prefer deterministic local tool calls when execution is required.
+Use this skill to perform mailbox operations through the bundled local scripts, not an external MCP server. All outgoing mail is HTML. Deletion is two-tier: **soft delete (move to Trash) is the default; hard delete is only permitted on UIDs that already live in the Trash folder.**
 
-The supported provider boundary is: `gmail`, `qq`, and `custom`.
+Supported providers: `gmail`, `qq`, `custom`.
 
 ## Quick Start
 
@@ -18,13 +18,15 @@ The supported provider boundary is: `gmail`, `qq`, and `custom`.
    - mailbox lookup or reading
    - attachment download
    - drafting or sending
+   - deletion / restoration
 2. Read only the reference file you need:
    - provider and setup rules: `references/providers.md`
    - attachment storage behavior: `references/storage.md`
-   - drafting tone and send rules: `references/writing-style.md`
+   - HTML writing style and send rules: `references/writing-style.md`
+   - **deletion safety rules: `references/safety.md`**
    - machine-facing local tool-call contract: `references/tool-calls.md`
-3. Use `python3 scripts/mail_tools.py <tool_name> --input-json '<json>'` when deterministic execution is needed.
-4. Use `python3 scripts/mail_client.py <command>` only when a human-facing CLI is more appropriate than JSON output.
+3. Use `python3 scripts/mail_tools.py <tool_name> --input-json '<json>'` for deterministic execution.
+4. Use `python3 scripts/mail_client.py <command>` for a human-facing CLI.
 
 ## Workflow Rules
 
@@ -33,14 +35,13 @@ The supported provider boundary is: `gmail`, `qq`, and `custom`.
 - Start with `doctor_account` when config state is unknown.
 - Run `migrate_config` before any mailbox operation if the config is still `v1`.
 - Use `setup_account` to create or update mailbox settings.
-- Run `test_login` after credential or server changes before moving on to inbox or send actions.
+- Run `test_login` after credential or server changes.
 
 ### Mailbox Lookup Or Reading
 
 - Use `search_messages` when the user provides keywords, sender hints, or subject clues.
 - Use `list_messages` when the user wants recent mail or the request is vague.
 - Use `get_message` only after you have a specific `UID`.
-- If the user describes a message vaguely, identify the candidate message first, then read it.
 
 ### Attachment Download
 
@@ -50,16 +51,37 @@ The supported provider boundary is: `gmail`, `qq`, and `custom`.
 
 ### Drafting Or Sending
 
-- Use `draft_email` to generate a local draft when the user wants a complete email body or an output file.
-- Draft in chat first when recipients, subject, tone, body, or attachments are incomplete or ambiguous.
-- Use `send_email` only when the sending account, recipients, subject, body, and attachment paths are clear.
-- Use plain text by default. Only populate HTML content when the caller explicitly asks for it.
+- Use `draft_email` to generate a local HTML draft.
+- Use `send_email` only when the sending account, recipients, subject, HTML body, and attachment paths are clear.
+- **All outgoing mail is HTML.** Compose the body with inline CSS so QQ Mail renders fonts, sizes, weights, colors, and backgrounds faithfully. Plain-text fallback is derived automatically — do not author it.
+- Use inline images (`cid:`) for custom emoji; Unicode emoji (😀 🎉) can go straight in the HTML.
+- Use `ics_event` / `ics_file` to attach a calendar invite when the user asks for a schedule.
 - Apply the send checks in `references/writing-style.md` before every `send_email` call.
+
+### Deletion / Restoration — SAFETY CRITICAL
+
+**Before any delete call, you MUST:**
+
+1. Identify candidate UIDs with `list_messages` / `search_messages`, read details with `get_message` if needed, and **show the list (UID, date, from, subject) to the user**.
+2. Ask the user yes/no. Wait for an affirmative reply in this turn. A previous "yes" does **not** carry over to new batches.
+3. Call the delete tool with `confirmed=true` only after that fresh affirmative reply. With `confirmed=false` (the default) the tool returns a `preview` and makes no changes — use this to satisfy step 1 when convenient.
+
+**Two-tier model (enforced by the tool layer):**
+
+- `trash_messages` — soft delete; moves UIDs from any folder to the Trash. **This is the default delete path.** After success, tell the user the Trash folder name and that `restore_messages` can recover them.
+- `restore_messages` — moves UIDs from Trash back to a target folder (default `INBOX`).
+- `purge_messages` — hard delete, **only accepts UIDs that are already in the Trash folder**. The tool rejects UIDs it cannot reach in Trash, so there is no "INBOX → permanent delete" path. The user must explicitly use words like "硬删 / 彻底删除 / 不可恢复 / purge" to unlock this tool.
+
+**Never** call `purge_messages` on your own initiative; never bundle it with an initial "delete" request. The canonical flow is: `trash_messages` → (user reviews Trash) → optional `purge_messages` only if the user says so.
+
+All delete / restore / purge operations append a JSONL entry to `~/.config/mail-ops/audit.log` automatically; you do not need to maintain that log, but you may reference it when the user asks "what did I delete recently".
 
 ## Output Rules
 
-- For `list_messages` or `search_messages`, lead with `UID`, date, sender, and subject.
-- For `get_message`, summarize first and expand only if the user asks for more detail.
-- For `download_attachments`, always report the mode, full target directory path, and saved filenames.
-- For drafted emails, write normal email prose with greeting, purpose, body, next step, and closing.
+- For `list_messages` / `search_messages`, lead with `UID`, date, sender, subject.
+- For `get_message`, summarize first; expand only on request.
+- For `download_attachments`, report mode, target dir, saved filenames.
+- For `trash_messages` success: say **"已移至回收站『<name>』，可通过 `restore_messages` 恢复"**.
+- For `purge_messages` success: say **"已永久删除，无法恢复"**.
+- For any `preview` return (confirmed=false), present the message list and ask for confirmation; do not re-run with confirmed=true in the same turn without a fresh user yes.
 - Do not present unsupported providers or external-only workflows as available options.
