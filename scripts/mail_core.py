@@ -14,9 +14,10 @@ import smtplib
 import socket
 import ssl
 import tempfile
+import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
@@ -2246,5 +2247,107 @@ def draft_email(
         "html_draft": html_draft,
         "text_preview": derive_plain_from_html(html_draft),
         "output_path": output_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 定时发送邮件（Resend API 策略一）
+# ---------------------------------------------------------------------------
+
+RESEND_API_BASE = "https://api.resend.com/emails"
+
+
+def send_scheduled_email(
+    *,
+    to: str | list[str],
+    subject: str,
+    html_body: str,
+    from_addr: str | None = None,
+    api_key: str | None = None,
+    delay_minutes: int | None = None,
+    scheduled_at: str | None = None,
+) -> dict[str, Any]:
+    """通过 Resend API 创建定时邮件任务。纯 HTTP，零系统依赖，跨平台。
+
+    参数:
+        to: 收件人地址（字符串或列表）。
+        subject: 邮件主题。
+        html_body: HTML 正文。
+        from_addr: 发件人地址。默认从环境变量 RESEND_FROM 读取，回退 onboarding@resend.dev。
+        api_key: Resend API Key。默认从环境变量 RESEND_API_KEY 读取。
+        delay_minutes: 几分钟后发送（与 scheduled_at 二选一）。
+        scheduled_at: 明确的 ISO 8601 字符串（与 delay_minutes 二选一）。
+    """
+    key = (api_key or os.environ.get("RESEND_API_KEY", "")).strip()
+    if not key:
+        raise EmailClientError(
+            "Resend API Key 缺失。请设置 RESEND_API_KEY 环境变量或在参数中传入 api_key。",
+            code="missing_api_key",
+        )
+
+    sender = (from_addr or os.environ.get("RESEND_FROM", "onboarding@resend.dev")).strip()
+    if not sender:
+        sender = "onboarding@resend.dev"
+
+    recipients = normalize_recipients(to)
+
+    if scheduled_at and delay_minutes is not None:
+        raise EmailClientError(
+            "scheduled_at 与 delay_minutes 不能同时传入", code="invalid_request"
+        )
+
+    if scheduled_at:
+        final_scheduled = scheduled_at
+    elif delay_minutes is not None:
+        if delay_minutes < 1:
+            raise EmailClientError("delay_minutes 至少为 1", code="invalid_request")
+        dt = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+        final_scheduled = dt.isoformat()
+    else:
+        raise EmailClientError("必须传入 scheduled_at 或 delay_minutes", code="invalid_request")
+
+    payload = {
+        "from": sender,
+        "to": recipients,
+        "subject": subject,
+        "html": html_body,
+        "scheduled_at": final_scheduled,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    req = urllib.request.Request(
+        RESEND_API_BASE,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "MailOpsSkill/1.0 (Python-urllib)",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8")
+            result = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8") if exc.fp else ""
+        raise EmailClientError(
+            f"Resend API error {exc.code}: {err_body}",
+            code="api_error",
+            details={"status": exc.code, "response": err_body},
+        ) from exc
+    except Exception as exc:
+        raise EmailClientError(f"调用 Resend API 失败: {exc}", code="api_error") from exc
+
+    return {
+        "status": "ok",
+        "provider": "resend",
+        "to": recipients,
+        "subject": subject,
+        "scheduled_at": final_scheduled,
+        "resend_id": result.get("id"),
+        "raw_response": result,
     }
 

@@ -53,8 +53,11 @@ Supported providers: `gmail`, `qq`, `custom`.
 
 - Use `draft_email` to generate a local HTML draft.
 - Use `send_email` only when the sending account, recipients, subject, HTML body, and attachment paths are clear.
+- Use `send_scheduled_email` when the user asks for delayed delivery. It calls the Resend API with a `scheduled_at` timestamp; no local AI or OS scheduler is required.
+  - Requires `RESEND_API_KEY` environment variable (or `api_key` parameter).
+  - When the domain is not yet verified at Resend, `from` defaults to `onboarding@resend.dev` and recipients are restricted to the registered email address.
 - **All outgoing mail is HTML.** Compose the body with inline CSS so QQ Mail renders fonts, sizes, weights, colors, and backgrounds faithfully. Plain-text fallback is derived automatically — do not author it.
-- Use inline images (`cid:`) for custom emoji; Unicode emoji (😀 🎉) can go straight in the HTML.
+- Use inline images (`cid:`) for custom emoji; Unicode emoji can go straight in the HTML.
 - Use `ics_event` / `ics_file` to attach a calendar invite when the user asks for a schedule.
 - Apply the send checks in `references/writing-style.md` before every `send_email` call.
 

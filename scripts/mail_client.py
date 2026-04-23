@@ -178,6 +178,21 @@ def cmd_send_email(args: argparse.Namespace) -> None:
     pretty_dump(run_tool("send_email", payload))
 
 
+def cmd_send_scheduled_email(args: argparse.Namespace) -> None:
+    payload: dict[str, Any] = {
+        "to": args.to,
+        "subject": args.subject,
+        "html_body": load_html_body(args),
+    }
+    if args.from_addr:
+        payload["from_addr"] = args.from_addr
+    if args.api_key:
+        payload["api_key"] = args.api_key
+    if args.delay_minutes is not None:
+        payload["delay_minutes"] = args.delay_minutes
+    pretty_dump(run_tool("send_scheduled_email", payload))
+
+
 def cmd_draft_email(args: argparse.Namespace) -> None:
     body_text = ""
     if getattr(args, "body_file", None):
@@ -326,6 +341,16 @@ def build_parser() -> argparse.ArgumentParser:
     draft_parser.add_argument("--body-file")
     draft_parser.add_argument("--output")
     draft_parser.set_defaults(func=cmd_draft_email)
+
+    scheduled_parser = subparsers.add_parser("send_scheduled_email", help="通过 Resend API 定时发送邮件")
+    scheduled_parser.add_argument("--to", required=True, help="收件人地址")
+    scheduled_parser.add_argument("--subject", required=True, help="邮件主题")
+    scheduled_parser.add_argument("--html", help="HTML 正文字符串")
+    scheduled_parser.add_argument("--html-file", help="HTML 正文文件路径")
+    scheduled_parser.add_argument("--from", dest="from_addr", default=None, help="发件人地址（默认读 RESEND_FROM 环境变量）")
+    scheduled_parser.add_argument("--delay-minutes", type=int, default=3, help="几分钟后发送（默认 3）")
+    scheduled_parser.add_argument("--api-key", default=None, help="Resend API Key（默认读 RESEND_API_KEY 环境变量）")
+    scheduled_parser.set_defaults(func=cmd_send_scheduled_email)
 
     folders_parser = subparsers.add_parser("list_folders", help="列出邮箱所有文件夹并识别回收站")
     folders_parser.add_argument("--account", required=True)
