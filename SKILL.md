@@ -49,10 +49,20 @@ Supported providers: `gmail`, `qq`, `custom`.
 - Default to `mode="temp"`.
 - Use `mode="archive"` only when the user explicitly wants long-lived storage.
 
+### Local File Registration
+
+- Use `register_attachments` when the user wants to send local files (not downloaded from mailbox) as attachments.
+- This registers the files in the approval manifest (`.codex-mail-attachments.json`) so `send_email` can accept them.
+- Pass one or more file paths via the `files` parameter (string or string array).
+- The tool validates each file exists and is not a symlink before registering.
+- After registration, the files can be passed to `send_email`'s `attachments` parameter.
+- Example flow: `register_attachments` → `send_email` with the same paths.
+
 ### Drafting Or Sending
 
 - Use `draft_email` to generate a local HTML draft.
 - Use `send_email` only when the sending account, recipients, subject, HTML body, and attachment paths are clear.
+- **Attachment requirement:** Files passed to `send_email`'s `attachments` parameter must be in an approved directory (with a `.codex-mail-attachments.json` manifest). Files from `download_attachments` are auto-registered. For local files, call `register_attachments` first.
 - Use `send_scheduled_email` when the user asks for delayed delivery. It calls the Resend API with a `scheduled_at` timestamp; no local AI or OS scheduler is required.
   - Requires `RESEND_API_KEY` environment variable (or `api_key` parameter).
   - When the domain is not yet verified at Resend, `from` defaults to `onboarding@resend.dev` and recipients are restricted to the registered email address.
@@ -84,6 +94,7 @@ All delete / restore / purge operations append a JSONL entry to `~/.config/mail-
 - For `list_messages` / `search_messages`, lead with `UID`, date, sender, subject.
 - For `get_message`, summarize first; expand only on request.
 - For `download_attachments`, report mode, target dir, saved filenames.
+- For `register_attachments`, report each registered file path and directory; list any errors.
 - For `trash_messages` success: say **"已移至回收站『<name>』，可通过 `restore_messages` 恢复"**.
 - For `purge_messages` success: say **"已永久删除，无法恢复"**.
 - For any `preview` return (confirmed=false), present the message list and ask for confirmation; do not re-run with confirmed=true in the same turn without a fresh user yes.

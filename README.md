@@ -48,7 +48,7 @@ PYTHONPATH=scripts python3 scripts/mail_client.py send_scheduled_email \
 - **人工调试**：`python3 scripts/mail_client.py <command> [flags...]`
 - **机器调用**：`python3 scripts/mail_tools.py <tool> --input-json '{...}'`
 
-常用命令：`send_email`、`send_scheduled_email`、`list_messages`、`search_messages`、`get_message`、`download_attachments`、`trash_messages`、`restore_messages`、`purge_messages`、`setup_account`、`test_login`。
+常用命令：`send_email`、`send_scheduled_email`、`list_messages`、`search_messages`、`get_message`、`download_attachments`、`register_attachments`、`trash_messages`、`restore_messages`、`purge_messages`、`setup_account`、`test_login`。
 
 ---
 
@@ -71,6 +71,9 @@ Usage:
 - List messages:    list_messages --input-json '{"account":"default","folder":"INBOX","limit":20}'
 - Search:           search_messages --input-json '{"account":"default","query":"keyword"}'
 - Read message:     get_message --input-json '{"account":"default","uid":"123"}'
+- Register local files (for sending local attachments):
+                    register_attachments --input-json '{"files":["/path/to/file1.pdf","/path/to/file2.zip"]}'
+- Send with local:  send_email --input-json '{"account":"default","to":"x@qq.com","subject":"s","html_body":"<p>h</p>","attachments":["/path/to/file1.pdf"]}'
 - Trash (preview):  trash_messages --input-json '{"account":"default","uids":["123"]}'
 - Trash (confirm):  trash_messages --input-json '{"account":"default","uids":["123"],"confirmed":true}'
 - Restore:          restore_messages --input-json '{"account":"default","uids":["123"],"confirmed":true}'

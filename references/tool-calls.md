@@ -17,6 +17,7 @@ python3 scripts/mail_tools.py <tool_name> --input-json '<json>'
 - `search_messages`
 - `get_message`
 - `download_attachments`
+- `register_attachments`
 - `send_email`
 - `send_scheduled_email`
 - `draft_email`

@@ -1056,6 +1056,68 @@ def _validate_send_attachment(path_value: str) -> Path:
     return resolved
 
 
+def register_attachments(
+    *,
+    files: str | list[str],
+) -> dict[str, Any]:
+    """将本地文件注册到附件审批清单，使其可用于 send_email。
+
+    每个文件所在目录会自动创建/更新 .codex-mail-attachments.json。
+    """
+    if isinstance(files, str):
+        files = [files]
+    if not files:
+        raise EmailClientError("files list is empty", code="invalid_request")
+
+    registered: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+
+    # 按目录分组处理
+    dir_files: dict[Path, list[Path]] = {}
+    for raw_path in files:
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_symlink():
+            errors.append({"file": raw_path, "error": "symlink not allowed"})
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            errors.append({"file": raw_path, "error": "file not found"})
+            continue
+        if not resolved.is_file():
+            errors.append({"file": raw_path, "error": "not a regular file"})
+            continue
+        parent = resolved.parent
+        dir_files.setdefault(parent, []).append(resolved)
+
+    # 逐目录更新 manifest
+    for parent, paths in dir_files.items():
+        manifest = _attachment_manifest_path(parent)
+        existing: set[str] = set()
+        if manifest.is_file():
+            try:
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                existing = set(payload.get("approved_files", []))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        for p in paths:
+            existing.add(p.name)
+            registered.append({"file": str(p), "directory": str(parent)})
+
+        payload = {
+            "version": 1,
+            "approved_files": sorted(existing),
+        }
+        manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        manifest.chmod(0o600)
+
+    return {
+        "status": "ok",
+        "registered": registered,
+        "errors": errors if errors else None,
+    }
+
+
 def save_attachments(msg: Message, target_dir: Path) -> list[Path]:
     saved: list[Path] = []
     target_dir.mkdir(parents=True, exist_ok=True)
