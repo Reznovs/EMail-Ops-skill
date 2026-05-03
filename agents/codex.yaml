@@ -9,7 +9,7 @@ policy:
 # Codex 特定配置
 codex:
   skill_path: "SKILL.md"
-  tool_executable: "python3 scripts/mail_tools.py"
+  tool_executable: "python scripts/mail_tools.py"
   requires_python: true
   supported_providers:
     - gmail

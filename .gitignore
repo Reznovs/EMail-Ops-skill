@@ -8,7 +8,9 @@ __pycache__/
 *.swo
 
 # 本地凭据与运行产物（绝不进仓库）
-config/
+config/accounts.json
+config/accounts.local.json
+config/audit.log
 accounts.json
 accounts.local.json
 audit.log

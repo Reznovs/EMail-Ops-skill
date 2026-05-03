@@ -10,7 +10,13 @@ scripts/mail_tools.sh <tool_name> --input-json '<json>'
 
 All tools (except `setup_account` and `migrate_config`) require a valid config file with `setup: 1`.
 
-Config path defaults to `<project_root>/config/accounts.json`, overridable via `MAIL_OPS_ACCOUNTS` env var.
+Config path defaults to an OS-specific user directory:
+- Linux: `~/.config/mail-ops/accounts.json`
+- macOS: `~/Library/Application Support/mail-ops/accounts.json`
+- Windows: `%APPDATA%/mail-ops/accounts.json`
+
+Overridable via `MAIL_OPS_ACCOUNTS` (or legacy `CODEX_MAIL_ACCOUNTS`) env var.
+If a legacy `<project_root>/config/accounts.json` exists but the OS-specific path does not, the config is auto-copied to the new location on first use.
 
 ## Tool Names
 

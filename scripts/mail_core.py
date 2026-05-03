@@ -34,20 +34,41 @@ TEMP_DOWNLOAD_PREFIX = "codex-mail-"
 APPROVED_ATTACHMENTS_FILE = ".codex-mail-attachments.json"
 
 
-def _resolve_default_config() -> Path:
-    """跨平台的默认凭据文件路径。
+_LEGACY_CONFIG = Path(__file__).resolve().parent.parent / "config" / "accounts.json"
 
-    优先级：
-    1. 环境变量 `MAIL_OPS_ACCOUNTS`（新）或 `CODEX_MAIL_ACCOUNTS`（旧，向后兼容）
-    2. 项目本地：<项目根>/config/accounts.json（三平台统一）
-    """
+
+def _user_config_dir() -> Path:
+    """OS-specific user config directory for mail-ops."""
+    if os.name == "nt":
+        return Path(os.environ["APPDATA"]) / "mail-ops"
+    home = Path.home()
+    if (home / "Library").is_dir():
+        return home / "Library" / "Application Support" / "mail-ops"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg).expanduser() if xdg else home / ".config"
+    return base / "mail-ops"
+
+
+def _resolve_default_config() -> Path:
     for env_name in ("MAIL_OPS_ACCOUNTS", "CODEX_MAIL_ACCOUNTS"):
         value = os.environ.get(env_name)
         if value:
             return Path(value).expanduser()
 
-    project_root = Path(__file__).resolve().parent.parent
-    return project_root / "config" / "accounts.json"
+    config_dir = _user_config_dir()
+    new_path = config_dir / "accounts.json"
+
+    # Auto-migrate from legacy project-relative location
+    if not new_path.exists() and _LEGACY_CONFIG.exists():
+        config_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(_LEGACY_CONFIG), str(new_path))
+        if os.name != "nt":
+            try:
+                os.chmod(new_path, 0o600)
+            except OSError:
+                pass
+
+    return new_path
 
 
 DEFAULT_CONFIG = _resolve_default_config()
@@ -990,7 +1011,11 @@ def _register_saved_attachments(target_dir: Path, saved: list[Path]) -> None:
         "approved_files": sorted(item.name for item in saved),
     }
     manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    manifest.chmod(0o600)
+    if os.name != "nt":
+        try:
+            manifest.chmod(0o600)
+        except OSError:
+            pass
 
 
 def _load_approved_attachment_names(target_dir: Path) -> set[str]:
@@ -1081,7 +1106,11 @@ def register_attachments(
             "approved_files": sorted(existing),
         }
         manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        manifest.chmod(0o600)
+        if os.name != "nt":
+            try:
+                manifest.chmod(0o600)
+            except OSError:
+                pass
 
     return {
         "status": "ok",
@@ -1093,7 +1122,11 @@ def register_attachments(
 def save_attachments(msg: Message, target_dir: Path) -> list[Path]:
     saved: list[Path] = []
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_dir.chmod(0o700)
+    if os.name != "nt":
+        try:
+            target_dir.chmod(0o700)
+        except OSError:
+            pass
     used_names: set[str] = set()
     for index, part in enumerate(msg.walk(), start=1):
         filename = part.get_filename()
@@ -1114,7 +1147,11 @@ def save_attachments(msg: Message, target_dir: Path) -> list[Path]:
             continue
         path = target_dir / candidate
         path.write_bytes(payload)
-        path.chmod(0o600)
+        if os.name != "nt":
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
         saved.append(path)
     _register_saved_attachments(target_dir, saved)
     return saved
@@ -1796,7 +1833,7 @@ TRASH_CANDIDATES = (
 
 
 def _audit_log_path() -> Path:
-    return DEFAULT_CONFIG.parent / "audit.log"
+    return _user_config_dir() / "audit.log"
 
 
 def _append_audit(entry: dict[str, Any]) -> None:
