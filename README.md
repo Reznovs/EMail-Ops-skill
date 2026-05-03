@@ -81,17 +81,17 @@ cd EMail-Ops-skill
 
 # 参考 references/accounts.example.json 创建 config/accounts.json
 # 然后测试连接
-PYTHONPATH=scripts python3 scripts/mail_tools.py test_login --input-json '{}'
+scripts/mail_tools.sh test_login --input-json '{}'
 ```
 
 ## 两套接口
 
 | 接口 | 命令 | 适用场景 |
 |------|------|----------|
-| AI 工具调用 | `python3 scripts/mail_tools.py <tool> --input-json '{...}'` | Agent 自动化 |
-| 人工 CLI | `python3 scripts/mail_client.py <command> [flags...]` | 手动调试 |
+| AI 工具调用 | `scripts/mail_tools.sh <tool> --input-json '{...}'` | Agent 自动化 |
+| 人工 CLI | `scripts/mail_client.sh <command> [flags...]` | 手动调试 |
 
-所有命令都需要 `PYTHONPATH=scripts` 前缀。
+所有命令的 shell 入口脚本会自动探测 Python 解释器，兼容 Linux / macOS / Windows（python3 → python → py）。
 
 ## 支持的邮箱
 

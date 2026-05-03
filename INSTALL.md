@@ -42,7 +42,7 @@ cd EMail-Ops-skill
 
 收集到信息后，运行以下命令创建配置（把实际值替换进去）：
 
-PYTHONPATH=scripts python3 scripts/mail_tools.py setup_account --input-json '{
+scripts/mail_tools.sh setup_account --input-json '{
   "provider": "qq",
   "email": "<发件邮箱>",
   "auth_code": "<授权码>",
@@ -56,13 +56,13 @@ PYTHONPATH=scripts python3 scripts/mail_tools.py setup_account --input-json '{
 
 ## 第四步：验证连接
 
-PYTHONPATH=scripts python3 scripts/mail_tools.py test_login --input-json '{}'
+scripts/mail_tools.sh test_login --input-json '{}'
 
 看到 "test_login_status": "ok" 就说明配置成功。
 
 ## 第五步：发一封测试邮件
 
-PYTHONPATH=scripts python3 scripts/mail_tools.py send_email --input-json '{
+scripts/mail_tools.sh send_email --input-json '{
   "subject": "Mail Ops Skill 配置成功",
   "html_body": "<p>如果你看到这封邮件，说明配置一切正常！</p>"
 }'

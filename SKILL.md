@@ -25,8 +25,8 @@ Supported providers: `gmail`, `qq`, `custom`.
    - HTML writing style and send rules: `references/writing-style.md`
    - **deletion safety rules: `references/safety.md`**
    - machine-facing local tool-call contract: `references/tool-calls.md`
-3. Use `python3 scripts/mail_tools.py <tool_name> --input-json '<json>'` for deterministic execution.
-4. Use `python3 scripts/mail_client.py <command>` for a human-facing CLI.
+3. Use `scripts/mail_tools.sh <tool_name> --input-json '<json>'` for deterministic execution.
+4. Use `scripts/mail_client.sh <command>` for a human-facing CLI.
 
 ## Workflow Rules
 

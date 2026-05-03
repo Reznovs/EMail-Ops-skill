@@ -3,7 +3,7 @@
 ## Machine-Facing Entrypoint
 
 ```bash
-python3 scripts/mail_tools.py <tool_name> --input-json '<json>'
+scripts/mail_tools.sh <tool_name> --input-json '<json>'
 ```
 
 ## Configuration
@@ -89,5 +89,5 @@ Common error codes: `not_configured`, `invalid_setup`, `invalid_request`, `confi
 ## Human CLI
 
 ```bash
-python3 scripts/mail_client.py <command> [flags...]
+scripts/mail_client.sh <command> [flags...]
 ```

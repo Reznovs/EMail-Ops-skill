@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 for py in python3 python py; do
   if command -v "$py" >/dev/null 2>&1; then
-    exec "$py" "$SCRIPT_DIR/mail_client.py" "$@"
+    exec "$py" "$SCRIPT_DIR/mail_tools.py" "$@"
   fi
 done
 
