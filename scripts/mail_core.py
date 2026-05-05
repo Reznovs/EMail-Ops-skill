@@ -198,6 +198,13 @@ def check_setup(config_path: str | Path | None = None) -> dict[str, Any]:
             "配置未完成，请先调用 setup_account",
             code="not_configured",
         )
+    # v1 格式（accounts 为 list）需要先迁移
+    accounts = data.get("accounts")
+    if isinstance(accounts, list):
+        raise EmailClientError(
+            "配置格式过旧，请先调用 migrate_config",
+            code="migration_required",
+        )
     return data
 
 
@@ -295,7 +302,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
             os.chmod(path.parent, 0o700)
         except OSError:
             pass
-    temp_path = path.with_name(f".{path.name}.tmp")
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
     with open(temp_path, "w", encoding="utf-8") as handle:
         if os.name != "nt":
             os.chmod(temp_path, 0o600)
@@ -306,7 +313,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def _blank_v2() -> dict[str, Any]:
-    return {"version": CONFIG_VERSION, "accounts": {}}
+    return {"setup": 1, "version": CONFIG_VERSION, "accounts": {}}
 
 
 def security_from_flags(*, ssl_enabled: bool = True, starttls: bool = False) -> str:
@@ -840,6 +847,12 @@ def setup_account(
     resend_api_key: str | None = None,
     recipients: list[dict[str, Any]] | None = None,
     config_path: str | Path | None = None,
+    imap_host: str | None = None,
+    imap_port: int | None = None,
+    imap_security: str | None = None,
+    smtp_host: str | None = None,
+    smtp_port: int | None = None,
+    smtp_security: str | None = None,
 ) -> dict[str, Any]:
     """配置 sender 和 recipients，写入新格式 JSON，setup 设为 1。"""
     provider_name = provider.strip().lower()
@@ -850,14 +863,28 @@ def setup_account(
         raise EmailClientError("email is required", code="invalid_setup")
 
     preset = PROVIDER_PRESETS.get(provider_name, {})
-    if not preset:
+    if not preset and provider_name != "custom":
         raise EmailClientError(
-            f"不支持的 provider: {provider_name}，可选: {', '.join(PROVIDER_PRESETS.keys())}",
+            f"不支持的 provider: {provider_name}，可选: {', '.join(PROVIDER_PRESETS.keys())}, custom",
             code="invalid_setup",
         )
 
-    imap_cfg = preset["imap"]
-    smtp_cfg = preset["smtp"]
+    if preset:
+        imap_cfg = preset["imap"]
+        smtp_cfg = preset["smtp"]
+    else:
+        if not imap_host or not smtp_host:
+            raise EmailClientError(
+                "custom provider requires imap_host and smtp_host",
+                code="invalid_setup",
+            )
+        if imap_port is None or smtp_port is None:
+            raise EmailClientError(
+                "custom provider requires imap_port and smtp_port",
+                code="invalid_setup",
+            )
+        imap_cfg = ServerConfig(host=imap_host, port=imap_port, security=imap_security or "ssl")
+        smtp_cfg = ServerConfig(host=smtp_host, port=smtp_port, security=smtp_security or "ssl")
 
     final_display_name = (display_name or mailbox_email).strip()
     final_login_user = (login_user or mailbox_email).strip()
@@ -937,7 +964,7 @@ def clean_html_text(raw: str) -> str:
     text = re.sub(r'(?i)javascript\s*:', "", text)
     text = re.sub(r'(?i)data\s*:', "", text)
     text = re.sub(r'(?i)vbscript\s*:', "", text)
-    text = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", " ", text)
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
     text = re.sub(r"(?is)<br\s*/?>", "\n", text)
     text = re.sub(r"(?is)</p\s*>", "\n", text)
     text = re.sub(r"(?is)</div\s*>", "\n", text)
@@ -1357,7 +1384,14 @@ def create_imap_client(account: AccountConfig) -> imaplib.IMAP4 | imaplib.IMAP4_
     else:
         client = imaplib.IMAP4(account.imap.host, account.imap.port, CONNECT_TIMEOUT)
     if account.imap.uses_starttls:
-        client.starttls(ssl_context=context)
+        try:
+            client.starttls(ssl_context=context)
+        except Exception:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+            raise
     return client
 
 
@@ -1397,8 +1431,18 @@ class MailClient:
 
     def __enter__(self) -> "MailClient":
         self.imap = create_imap_client(self.account)
-        self.imap.login(self.account.login_user, self.account.auth.secret or "")
-        return self
+        try:
+            self.imap.login(self.account.login_user, self.account.auth.secret or "")
+        except Exception:
+            try:
+                self.imap.logout()
+            except Exception:
+                try:
+                    self.imap.shutdown()
+                except Exception:
+                    pass
+            self.imap = None
+            raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self.imap is None:
@@ -1467,9 +1511,18 @@ class MailClient:
             raise RuntimeError(f"failed to copy to {dest_folder}")
         imap.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
         try:
-            imap.uid("EXPUNGE", uid_set)
+            status, _ = imap.uid("EXPUNGE", uid_set)
+            if status == "OK":
+                return
         except Exception:
-            imap.expunge()
+            pass
+        # UID EXPUNGE 不可用：仅清除本批标记，不执行 blanket expunge
+        imap.uid("STORE", uid_set, "-FLAGS", "(\\Deleted)")
+        raise EmailClientError(
+            "服务器不支持 UID EXPUNGE，无法安全地只清理指定邮件。"
+            "邮件已复制到目标文件夹但源邮件的 \\Deleted 标记已撤回。",
+            code="unsupported_operation",
+        )
 
     def store_flags(self, uids: list[bytes], flags: str, operation: str = "+") -> None:
         if not uids:
@@ -1493,7 +1546,12 @@ class MailClient:
                 return
         except Exception:
             pass
-        imap.expunge()
+        imap.uid("STORE", uid_set, "-FLAGS", "(\\Deleted)")
+        raise EmailClientError(
+            "服务器不支持 UID EXPUNGE，无法安全地只删除指定邮件。"
+            "请在邮箱客户端中手动清理 Trash 文件夹。",
+            code="unsupported_operation",
+        )
 
     def search_all_uids(self) -> list[bytes]:
         status, data = self._require_imap().uid("search", None, "ALL")
@@ -1856,10 +1914,11 @@ def _append_audit(entry: dict[str, Any]) -> None:
 
 def _detect_trash_folder(folders: list[dict[str, str]], override: str | None = None) -> str | None:
     if override:
+        # override 必须在服务器文件夹列表中存在
         for item in folders:
             if item["name"] == override or item.get("raw_name") == override:
                 return item.get("raw_name") or item["name"]
-        return override
+        return None
     # 1) 按 IMAP 属性 \Trash 匹配
     for item in folders:
         if "\\Trash" in (item.get("attrs") or ""):
@@ -1870,9 +1929,13 @@ def _detect_trash_folder(folders: list[dict[str, str]], override: str | None = N
         if candidate in names:
             item = names[candidate]
             return item.get("raw_name") or item["name"]
-    # 3) 模糊匹配
+    # 3) 模糊匹配（排除垃圾邮件/Spam）
     for item in folders:
         lower = item["name"].lower()
+        attrs = item.get("attrs") or ""
+        is_spam = "\\Junk" in attrs or "垃圾邮件" in item["name"] or "junk" in lower or "spam" in lower
+        if is_spam:
+            continue
         if "trash" in lower or "删除" in item["name"] or "垃圾" in item["name"] or "废" in item["name"]:
             return item.get("raw_name") or item["name"]
     return None
@@ -2375,15 +2438,6 @@ def send_scheduled_email(
         or (sender_cfg or {}).get("email")
         or os.environ.get("RESEND_FROM", "onboarding@resend.dev")
     ).strip()
-    if not sender:
-        sender = "onboarding@resend.dev"
-    if not key:
-        raise EmailClientError(
-            "Resend API Key 缺失。请设置 RESEND_API_KEY 环境变量或在参数中传入 api_key。",
-            code="missing_api_key",
-        )
-
-    sender = (from_addr or os.environ.get("RESEND_FROM", "onboarding@resend.dev")).strip()
     if not sender:
         sender = "onboarding@resend.dev"
 

@@ -15,7 +15,7 @@
 
 Downloaded attachments are registered in an approval manifest inside the target directory.
 
-Only attachments saved through `download_attachments` are allowed to pass into `send_email`.
+Attachments saved through `download_attachments` or pre-approved via `register_attachments` are allowed to pass into `send_email`.
 
 ## Reporting
 

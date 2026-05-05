@@ -8,7 +8,7 @@ scripts/mail_tools.sh <tool_name> --input-json '<json>'
 
 ## Configuration
 
-All tools (except `setup_account` and `migrate_config`) require a valid config file with `setup: 1`.
+All tools (except `setup_account`, `migrate_config`, and `doctor_account`) require a valid config file with `setup: 1`.
 
 Config path defaults to an OS-specific user directory:
 - Linux: `~/.config/mail-ops/accounts.json`
@@ -31,6 +31,8 @@ If a legacy `<project_root>/config/accounts.json` exists but the OS-specific pat
   - `resend_api_key` (optional): Resend API Key
   - `recipients` (optional): `[{"email":"x@y.com","name":"Name","main":true}, ...]`
   - `config_path` (optional): 配置文件路径
+  - For `custom` provider (required): `imap_host`, `imap_port`, `smtp_host`, `smtp_port`
+  - For `custom` provider (optional): `imap_security` (default: ssl), `smtp_security` (default: ssl)
 - `doctor_account` — 检查配置完整性
 - `test_login` — 测试 IMAP/SMTP 登录
   - `imap_only` / `smtp_only` (optional): 只测一个通道

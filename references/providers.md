@@ -13,7 +13,9 @@ Do not present other built-in presets as available.
 Default config file（三平台统一）:
 
 ```text
-<project_root>/config/accounts.json
+Linux:   ~/.config/mail-ops/accounts.json
+macOS:   ~/Library/Application Support/mail-ops/accounts.json
+Windows: %APPDATA%/mail-ops/accounts.json
 ```
 
 Override path with:
@@ -44,16 +46,15 @@ export MAIL_OPS_ACCOUNTS=/custom/path/accounts.json
 
 ### Custom
 
-- Supply explicit IMAP and SMTP hosts
-- Supply explicit ports when defaults are unknown
-- Verify transport security mode carefully
+- Supply explicit IMAP and SMTP hosts, ports, and security mode via `imap_host`, `imap_port`, `imap_security`, `smtp_host`, `smtp_port`, `smtp_security` parameters
+- Provider name must be `"custom"`
 
 ## Minimal Setup Inputs
 
-- `account`
-- `provider`
+- `provider` (`gmail`, `qq`, or `custom`)
 - `email`
 - `display_name`
 - `login_user` when it differs from `email`
-- `auth_secret` when available
+- `auth_code` when available
+- For `custom`: `imap_host`, `imap_port`, `smtp_host`, `smtp_port` (required); `imap_security`, `smtp_security` (optional, defaults to `ssl`)
 - proxy settings only when required

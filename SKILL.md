@@ -88,7 +88,7 @@ Supported providers: `gmail`, `qq`, `custom`.
 
 **Never** call `purge_messages` on your own initiative; never bundle it with an initial "delete" request. The canonical flow is: `trash_messages` → (user reviews Trash) → optional `purge_messages` only if the user says so.
 
-All delete / restore / purge operations append a JSONL entry to `config/audit.log`（项目根目录下） automatically; you do not need to maintain that log, but you may reference it when the user asks "what did I delete recently".
+All delete / restore / purge operations append a JSONL entry to `<user config dir>/audit.log`（如 Linux: `~/.config/mail-ops/audit.log`） automatically; you do not need to maintain that log, but you may reference it when the user asks "what did I delete recently".
 
 ## Output Rules
 

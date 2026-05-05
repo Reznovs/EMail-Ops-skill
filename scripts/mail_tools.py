@@ -51,7 +51,7 @@ TOOL_MAP: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 
-_SKIP_SETUP_CHECK = {"setup_account", "migrate_config"}
+_SKIP_SETUP_CHECK = {"setup_account", "migrate_config", "doctor_account"}
 
 
 def run_tool(tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:

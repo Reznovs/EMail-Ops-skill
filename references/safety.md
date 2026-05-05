@@ -3,23 +3,23 @@
 ## Model
 
 - **Two-tier, not three.** Soft delete is the default path; hard delete is only allowed on UIDs already inside the Trash folder. There is no "INBOX → permanent delete" shortcut.
-- **Every delete/restore/purge operation preserves an audit trail** at `config/audit.log`（项目根目录下） (JSONL, UTC timestamps).
+- **Every delete/restore/purge operation preserves an audit trail** at `<config_dir>/audit.log`（OS 用户配置目录下，如 Linux: `~/.config/mail-ops/audit.log`） (JSONL, UTC timestamps).
 
 ## Tools
 
 | Tool | Operates on | What it does |
 |------|------------|---------------|
-| `list_folders` | any | Lists IMAP folders and auto-detects the Trash folder name. |
+| `list_folders` | any | Lists IMAP folders and auto-detects the Trash folder name. Accepts `config_path` only. |
 | `trash_messages` | any folder except Trash | Moves UIDs into the Trash. Fails if `folder` already equals Trash. |
 | `restore_messages` | Trash | Moves UIDs from Trash to `target_folder` (default `INBOX`). |
 | `purge_messages` | **Trash only** | Hard-deletes UIDs. Rejects any UID it cannot fetch from Trash. Irreversible. |
 
 All four accept:
 
-- `uids` (required, list of stringified integers, ≤ 50 per call)
-- `confirmed` (default `false`)
+- `uids` (required, list of stringified integers, ≤ 50 per call) — `list_folders` does not accept this
+- `confirmed` (default `false`) — `list_folders` does not accept this
 - `trash_folder` (optional override)
-- `config_path` (optional, defaults to `config/accounts.json`)
+- `config_path` (optional, defaults to OS user config directory)
 
 ## `confirmed` Gate
 
@@ -49,4 +49,4 @@ Every successful `trash` / `restore` / `purge` appends:
 {"ts":"2026-04-18T12:34:56+00:00","action":"trash","account":"default-send","folder":"INBOX","trash_folder":"Deleted Messages","uids":["123"],"messages":[{"uid":"123","subject":"...","from":"..."}]}
 ```
 
-Log location: `<dirname of accounts.json>/audit.log` (POSIX `0600`). Use it to answer "what did I delete recently" questions; it is not visible to remote parties and it is in `.gitignore`.
+Log location: `<user config dir>/audit.log` (POSIX `0600`). Use it to answer "what did I delete recently" questions; it is not visible to remote parties and it is in `.gitignore`.
